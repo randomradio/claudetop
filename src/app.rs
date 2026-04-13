@@ -13,6 +13,8 @@ pub struct App {
     pub last_refresh: Instant,
     pub paused: bool,
     pub cost_tracker: CostTracker,
+    /// Monotonic tick counter, incremented every frame (~250ms). Used for animations.
+    pub tick_count: u64,
 }
 
 impl App {
@@ -24,11 +26,14 @@ impl App {
             last_refresh: Instant::now(),
             paused: false,
             cost_tracker: CostTracker::new(),
+            tick_count: 0,
         }
     }
 
     /// Check whether a periodic refresh is due and trigger it if so.
     pub async fn tick(&mut self) {
+        self.tick_count = self.tick_count.wrapping_add(1);
+
         if self.paused {
             return;
         }
