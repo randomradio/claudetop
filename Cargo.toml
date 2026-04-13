@@ -1,6 +1,6 @@
 [package]
 name = "claudetop"
-version = "0.2.2"
+version = "0.2.3"
 edition = "2021"
 description = "Terminal dashboard for monitoring AI provider usage and costs"
 license = "MIT"
