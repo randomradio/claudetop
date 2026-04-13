@@ -249,7 +249,7 @@ fn draw_status_bar(frame: &mut Frame, area: Rect, app: &App) {
         Span::styled("[p] ", Style::default().fg(Color::Cyan)),
         Span::raw("pause"),
         Span::raw("  "),
-        Span::styled("[q] ", Style::default().fg(Color::Cyan)),
+        Span::styled("[q/Esc] ", Style::default().fg(Color::Cyan)),
         Span::raw("quit"),
         Span::raw("  |  "),
         Span::styled("Last refresh: ", Style::default().fg(Color::DarkGray)),

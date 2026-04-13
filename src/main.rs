@@ -56,26 +56,29 @@ async fn main() -> Result<()> {
         terminal.draw(|frame| ui::draw(frame, &app))?;
 
         if event::poll(tick_rate)? {
-            let ev = event::read()?;
-
-            // Only process key press events, not release or repeat
-            if let Event::Key(key) = &ev {
-                if key.kind != KeyEventKind::Press {
-                    continue;
-                }
-            }
-
-            let needs_action = app.handle_key(&ev);
-
-            if app.should_quit {
-                break;
-            }
-
-            // If 'r' was pressed, trigger manual refresh
-            if needs_action {
-                if let Event::Key(key) = &ev {
-                    if key.code == KeyCode::Char('r') {
-                        app.refresh().await?;
+            if let Event::Key(key) = event::read()? {
+                // Process Press events. On terminals without Kitty protocol,
+                // kind may always be Press. On terminals with it, filter out
+                // Release/Repeat to avoid double-firing.
+                if key.kind == KeyEventKind::Press || key.kind == KeyEventKind::Repeat {
+                    match key.code {
+                        KeyCode::Char('q') | KeyCode::Esc => {
+                            break;
+                        }
+                        KeyCode::Char('c')
+                            if key
+                                .modifiers
+                                .contains(crossterm::event::KeyModifiers::CONTROL) =>
+                        {
+                            break;
+                        }
+                        KeyCode::Char('r') => {
+                            let _ = app.refresh().await;
+                        }
+                        KeyCode::Char('p') => {
+                            app.paused = !app.paused;
+                        }
+                        _ => {}
                     }
                 }
             }
