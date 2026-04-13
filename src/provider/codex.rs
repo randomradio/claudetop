@@ -1,59 +1,67 @@
 use anyhow::Result;
-use chrono::Utc;
+use chrono::{DateTime, TimeZone, Utc};
 use serde::Deserialize;
+use std::fs;
+use std::path::PathBuf;
+use std::time::{Duration, SystemTime};
 
 use crate::config::ProviderConfig;
 use crate::provider::{Provider, ProviderKind, ProviderStatus, RateWindow, UsageSnapshot};
 
-#[derive(Deserialize)]
-struct CodexAuth {
-    tokens: Option<CodexTokens>,
-}
-
-#[derive(Deserialize)]
-struct CodexTokens {
-    access_token: Option<String>,
-}
-
-/// Represents the type of credential discovered.
-enum CredentialSource {
-    /// An API key (from config or OPENAI_API_KEY env var).
-    ApiKey(String),
-    /// An OAuth access_token from ~/.codex/auth.json.
-    OAuthToken(String),
-}
-
-/// Response shape for the OpenAI usage/completions endpoint.
-#[derive(Deserialize)]
-struct UsageResponse {
+/// Parsed from `event_msg` entries where `payload.type == "token_count"`.
+#[derive(Debug, Deserialize)]
+struct SessionEntry {
+    #[serde(rename = "type")]
+    entry_type: String,
     #[serde(default)]
-    data: Vec<UsageBucket>,
+    payload: serde_json::Value,
 }
 
-#[derive(Deserialize)]
-struct UsageBucket {
+#[derive(Debug, Deserialize)]
+struct TokenCountPayload {
+    info: TokenCountInfo,
     #[serde(default)]
-    results: Vec<UsageResult>,
+    rate_limits: Option<RateLimits>,
 }
 
-#[derive(Deserialize)]
-struct UsageResult {
+#[derive(Debug, Deserialize)]
+struct TokenCountInfo {
+    total_token_usage: TokenUsage,
+}
+
+#[derive(Debug, Deserialize)]
+struct TokenUsage {
     #[serde(default)]
     input_tokens: u64,
     #[serde(default)]
+    cached_input_tokens: u64,
+    #[serde(default)]
     output_tokens: u64,
+    #[serde(default)]
+    reasoning_output_tokens: u64,
 }
 
-/// Response shape for the OpenAI credit_grants endpoint.
-#[derive(Deserialize)]
-#[allow(dead_code)]
-struct CreditGrantsResponse {
-    total_available: Option<f64>,
-    total_granted: Option<f64>,
-    total_used: Option<f64>,
+#[derive(Debug, Deserialize)]
+struct RateLimits {
+    #[serde(default)]
+    limit_name: Option<String>,
+    #[serde(default)]
+    primary: Option<RateWindow_>,
+    #[serde(default)]
+    secondary: Option<RateWindow_>,
+    #[serde(default)]
+    plan_type: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RateWindow_ {
+    used_percent: f64,
+    window_minutes: u64,
+    resets_at: i64,
 }
 
 pub struct CodexProvider {
+    #[allow(dead_code)]
     config: ProviderConfig,
 }
 
@@ -62,249 +70,85 @@ impl CodexProvider {
         Self { config }
     }
 
-    /// Read the Codex CLI auth file at ~/.codex/auth.json and extract the access token.
-    fn read_codex_auth_file() -> Option<String> {
-        let home = dirs::home_dir()?;
-        let auth_path = home.join(".codex").join("auth.json");
-        let contents = std::fs::read_to_string(auth_path).ok()?;
-        let auth: CodexAuth = serde_json::from_str(&contents).ok()?;
-        auth.tokens?.access_token
+    /// Return the Codex sessions directory (~/.codex/sessions/).
+    fn sessions_dir() -> Option<PathBuf> {
+        dirs::home_dir().map(|h| h.join(".codex").join("sessions"))
     }
 
-    /// Discover an API key from config or environment (not OAuth).
-    fn discover_api_key(&self) -> Option<String> {
-        self.config
-            .api_key
-            .clone()
-            .or_else(|| self.config.token.clone())
-            .or_else(|| std::env::var("OPENAI_API_KEY").ok())
+    /// Find all JSONL session files modified within the last 30 days.
+    fn find_recent_sessions(dir: &PathBuf, cutoff: SystemTime) -> Vec<PathBuf> {
+        let mut files = Vec::new();
+        Self::collect_jsonl_files(dir, cutoff, &mut files);
+        files
     }
 
-    /// Discover the OAuth token from ~/.codex/auth.json.
-    fn discover_oauth_token() -> Option<String> {
-        Self::read_codex_auth_file()
-    }
-
-    /// Discover credentials with source information, in priority order:
-    /// 1. Config file api_key/token override
-    /// 2. Environment variable OPENAI_API_KEY
-    /// 3. OAuth access_token from ~/.codex/auth.json
-    fn discover_credential_source(&self) -> Option<CredentialSource> {
-        if let Some(key) = self.discover_api_key() {
-            return Some(CredentialSource::ApiKey(key));
-        }
-        Self::discover_oauth_token().map(CredentialSource::OAuthToken)
-    }
-
-    /// Parse a rate-limit header value as f64, returning None if missing or unparseable.
-    fn parse_header(headers: &reqwest::header::HeaderMap, name: &str) -> Option<f64> {
-        headers
-            .get(name)?
-            .to_str()
-            .ok()?
-            .parse::<f64>()
-            .ok()
-    }
-
-    /// Build a RateWindow from limit/remaining header pairs.
-    fn build_rate_window(
-        headers: &reqwest::header::HeaderMap,
-        label: &str,
-        limit_header: &str,
-        remaining_header: &str,
-    ) -> Option<RateWindow> {
-        let limit = Self::parse_header(headers, limit_header)?;
-        let remaining = Self::parse_header(headers, remaining_header)?;
-        if limit <= 0.0 {
-            return None;
-        }
-        let used_percent = (limit - remaining) / limit * 100.0;
-        Some(RateWindow {
-            label: label.to_string(),
-            used_percent,
-            reset_at: None,
-        })
-    }
-
-    /// Try to fetch usage via the OpenAI usage/completions endpoint using an OAuth token.
-    async fn fetch_usage_via_oauth(
-        &self,
-        client: &reqwest::Client,
-        token: &str,
-    ) -> Option<UsageSnapshot> {
-        let now = Utc::now().timestamp();
-        let thirty_days_ago = now - (30 * 24 * 60 * 60);
-
-        let url = format!(
-            "https://api.openai.com/v1/organization/usage/completions?start_time={}&end_time={}&bucket_width=1d",
-            thirty_days_ago, now
-        );
-
-        let response = client
-            .get(&url)
-            .header("Authorization", format!("Bearer {}", token))
-            .send()
-            .await
-            .ok()?;
-
-        if response.status().is_success() {
-            let usage: UsageResponse = response.json().await.ok()?;
-            let total_tokens: u64 = usage
-                .data
-                .iter()
-                .flat_map(|b| &b.results)
-                .map(|r| r.input_tokens + r.output_tokens)
-                .sum();
-
-            // Rough cost estimate: ~$2.50 per 1M tokens average across models
-            let cost_30d = (total_tokens as f64) / 1_000_000.0 * 2.50;
-
-            return Some(UsageSnapshot {
-                provider: ProviderKind::Codex,
-                status: ProviderStatus::Ok,
-                plan_name: None,
-                rate_windows: Vec::new(),
-                credits_remaining: None,
-                cost_30d: Some(cost_30d),
-                updated_at: Utc::now(),
-            });
-        }
-
-        // If the usage endpoint fails, try the credit_grants endpoint.
-        self.fetch_credits_via_oauth(client, token).await
-    }
-
-    /// Try to fetch credit balance via the billing/credit_grants endpoint.
-    async fn fetch_credits_via_oauth(
-        &self,
-        client: &reqwest::Client,
-        token: &str,
-    ) -> Option<UsageSnapshot> {
-        let response = client
-            .get("https://api.openai.com/dashboard/billing/credit_grants")
-            .header("Authorization", format!("Bearer {}", token))
-            .send()
-            .await
-            .ok()?;
-
-        if !response.status().is_success() {
-            return None;
-        }
-
-        let credits: CreditGrantsResponse = response.json().await.ok()?;
-        let remaining = credits.total_available.map(|v| format!("${:.2}", v));
-        let cost = credits.total_used;
-
-        Some(UsageSnapshot {
-            provider: ProviderKind::Codex,
-            status: ProviderStatus::Ok,
-            plan_name: None,
-            rate_windows: Vec::new(),
-            credits_remaining: remaining,
-            cost_30d: cost,
-            updated_at: Utc::now(),
-        })
-    }
-
-    /// Fallback: make a minimal chat completion probe to extract rate-limit headers.
-    /// Only used with an actual API key (not OAuth tokens).
-    async fn fetch_usage_via_probe(
-        &self,
-        client: &reqwest::Client,
-        api_key: &str,
-    ) -> Result<UsageSnapshot> {
-        let response = client
-            .post("https://api.openai.com/v1/chat/completions")
-            .header("Authorization", format!("Bearer {}", api_key))
-            .json(&serde_json::json!({
-                "model": "gpt-4o-mini",
-                "messages": [{"role": "user", "content": "hi"}],
-                "max_tokens": 1
-            }))
-            .send()
-            .await;
-
-        let response = match response {
-            Ok(r) => r,
-            Err(e) => {
-                return Ok(UsageSnapshot {
-                    provider: ProviderKind::Codex,
-                    status: ProviderStatus::Unavailable(format!("Request failed: {}", e)),
-                    plan_name: None,
-                    rate_windows: Vec::new(),
-                    credits_remaining: None,
-                    cost_30d: None,
-                    updated_at: Utc::now(),
-                });
-            }
+    fn collect_jsonl_files(dir: &PathBuf, cutoff: SystemTime, out: &mut Vec<PathBuf>) {
+        let entries = match fs::read_dir(dir) {
+            Ok(e) => e,
+            Err(_) => return,
         };
-
-        let headers = response.headers().clone();
-
-        if !response.status().is_success()
-            && headers.get("x-ratelimit-limit-requests").is_none()
-        {
-            let status_code = response.status();
-            let body = response.text().await.unwrap_or_default();
-            return Ok(UsageSnapshot {
-                provider: ProviderKind::Codex,
-                status: ProviderStatus::Unavailable(format!(
-                    "API returned {} \u{2014} {}",
-                    status_code,
-                    body.chars().take(200).collect::<String>()
-                )),
-                plan_name: None,
-                rate_windows: Vec::new(),
-                credits_remaining: None,
-                cost_30d: None,
-                updated_at: Utc::now(),
-            });
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                Self::collect_jsonl_files(&path, cutoff, out);
+                continue;
+            }
+            if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+                continue;
+            }
+            if let Ok(meta) = path.metadata() {
+                if let Ok(modified) = meta.modified() {
+                    if modified >= cutoff {
+                        out.push(path);
+                    }
+                }
+            }
         }
-
-        let mut rate_windows = Vec::new();
-
-        if let Some(rw) = Self::build_rate_window(
-            &headers,
-            "Requests",
-            "x-ratelimit-limit-requests",
-            "x-ratelimit-remaining-requests",
-        ) {
-            rate_windows.push(rw);
-        }
-
-        if let Some(rw) = Self::build_rate_window(
-            &headers,
-            "Tokens",
-            "x-ratelimit-limit-tokens",
-            "x-ratelimit-remaining-tokens",
-        ) {
-            rate_windows.push(rw);
-        }
-
-        Ok(UsageSnapshot {
-            provider: ProviderKind::Codex,
-            status: ProviderStatus::Ok,
-            plan_name: None,
-            rate_windows,
-            credits_remaining: None,
-            cost_30d: None,
-            updated_at: Utc::now(),
-        })
     }
 
-    /// Check if the codex CLI is available on the system.
-    #[allow(dead_code)]
-    fn shell_codex_status() -> Option<UsageSnapshot> {
-        let which = std::process::Command::new("which")
-            .arg("codex")
-            .output()
-            .ok()?;
-        if !which.status.success() {
-            return None;
+    /// Parse a single session JSONL and return the last token_count entry's data.
+    /// The last entry has cumulative totals for that session.
+    fn parse_session(path: &PathBuf) -> Option<(TokenUsage, Option<RateLimits>)> {
+        let contents = fs::read_to_string(path).ok()?;
+        let mut last_usage: Option<TokenUsage> = None;
+        let mut last_rate_limits: Option<RateLimits> = None;
+
+        for line in contents.lines() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            let entry: SessionEntry = match serde_json::from_str(line) {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
+            if entry.entry_type != "event_msg" {
+                continue;
+            }
+            let payload_type = entry.payload.get("type").and_then(|v| v.as_str());
+            if payload_type != Some("token_count") {
+                continue;
+            }
+            let tc: TokenCountPayload = match serde_json::from_value(entry.payload) {
+                Ok(tc) => tc,
+                Err(_) => continue,
+            };
+            last_usage = Some(tc.info.total_token_usage);
+            last_rate_limits = tc.rate_limits;
         }
 
-        // Codex CLI parsing can be added later if needed.
-        None
+        last_usage.map(|u| (u, last_rate_limits))
+    }
+
+    /// Estimate cost from token usage using Codex/OpenAI pricing.
+    fn estimate_cost(usage: &TokenUsage) -> f64 {
+        // GPT-5 / Codex pricing estimate (per 1M tokens):
+        // Non-cached input: ~$2.50, Cached input: ~$0.25, Output: ~$10.00
+        let non_cached_input = usage.input_tokens.saturating_sub(usage.cached_input_tokens);
+        let input_cost = non_cached_input as f64 * 2.50 / 1_000_000.0;
+        let cache_cost = usage.cached_input_tokens as f64 * 0.25 / 1_000_000.0;
+        let output_cost = usage.output_tokens as f64 * 10.0 / 1_000_000.0;
+        input_cost + cache_cost + output_cost
     }
 }
 
@@ -315,50 +159,235 @@ impl Provider for CodexProvider {
     }
 
     async fn fetch_usage(&self) -> Result<UsageSnapshot> {
-        let credential = match self.discover_credential_source() {
-            Some(c) => c,
-            None => {
+        let sessions_dir = match Self::sessions_dir() {
+            Some(d) if d.exists() => d,
+            _ => {
                 return Ok(UsageSnapshot::not_configured(
                     ProviderKind::Codex,
-                    "No API key configured",
+                    "No Codex sessions found (~/.codex/sessions/)",
                 ));
             }
         };
 
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(10))
-            .build()?;
+        let cutoff = SystemTime::now()
+            .checked_sub(Duration::from_secs(30 * 24 * 3600))
+            .unwrap_or(SystemTime::UNIX_EPOCH);
 
-        match credential {
-            CredentialSource::OAuthToken(token) => {
-                // Try OAuth-based usage endpoints first.
-                if let Some(snapshot) = self.fetch_usage_via_oauth(&client, &token).await {
-                    return Ok(snapshot);
+        let session_files = Self::find_recent_sessions(&sessions_dir, cutoff);
+        if session_files.is_empty() {
+            return Ok(UsageSnapshot::not_configured(
+                ProviderKind::Codex,
+                "No recent Codex sessions found",
+            ));
+        }
+
+        // Sum token usage across all recent sessions, keep rate_limits from the newest.
+        let mut total_input: u64 = 0;
+        let mut total_cached: u64 = 0;
+        let mut total_output: u64 = 0;
+        let mut latest_rate_limits: Option<RateLimits> = None;
+
+        // Sort by path (contains date) to process chronologically.
+        let mut sorted_files = session_files;
+        sorted_files.sort();
+
+        for path in &sorted_files {
+            if let Some((usage, rate_limits)) = Self::parse_session(path) {
+                total_input += usage.input_tokens;
+                total_cached += usage.cached_input_tokens;
+                total_output += usage.output_tokens;
+                // Keep overwriting — last file = most recent rate limits.
+                if rate_limits.is_some() {
+                    latest_rate_limits = rate_limits;
                 }
-                // OAuth endpoints didn't work; report as connected but with no usage data.
-                Ok(UsageSnapshot {
-                    provider: ProviderKind::Codex,
-                    status: ProviderStatus::Ok,
-                    plan_name: None,
-                    rate_windows: Vec::new(),
-                    credits_remaining: None,
-                    cost_30d: None,
-                    updated_at: Utc::now(),
-                })
-            }
-            CredentialSource::ApiKey(key) => {
-                // API keys use the probe approach as fallback.
-                self.fetch_usage_via_probe(&client, &key).await
             }
         }
+
+        let total_usage = TokenUsage {
+            input_tokens: total_input,
+            cached_input_tokens: total_cached,
+            output_tokens: total_output,
+            reasoning_output_tokens: 0,
+        };
+
+        let cost_30d = Self::estimate_cost(&total_usage);
+
+        // Build rate windows from the latest session's rate limits.
+        let mut rate_windows = Vec::new();
+        let mut plan_name: Option<String> = None;
+
+        if let Some(ref rl) = latest_rate_limits {
+            plan_name = rl.plan_type.clone();
+
+            if let Some(ref primary) = rl.primary {
+                let reset_at: Option<DateTime<Utc>> = Utc.timestamp_opt(primary.resets_at, 0).single();
+                rate_windows.push(RateWindow {
+                    label: format!("{}h window", primary.window_minutes / 60),
+                    used_percent: primary.used_percent,
+                    reset_at,
+                });
+            }
+
+            if let Some(ref secondary) = rl.secondary {
+                let reset_at: Option<DateTime<Utc>> = Utc.timestamp_opt(secondary.resets_at, 0).single();
+                rate_windows.push(RateWindow {
+                    label: format!("{}d window", secondary.window_minutes / 60 / 24),
+                    used_percent: secondary.used_percent,
+                    reset_at,
+                });
+            }
+        }
+
+        Ok(UsageSnapshot {
+            provider: ProviderKind::Codex,
+            status: ProviderStatus::Ok,
+            plan_name,
+            rate_windows,
+            credits_remaining: None,
+            cost_30d: Some(cost_30d),
+            updated_at: Utc::now(),
+        })
     }
 
     fn discover_credentials(&self) -> Option<String> {
-        self.config
-            .api_key
-            .clone()
-            .or_else(|| self.config.token.clone())
-            .or_else(|| std::env::var("OPENAI_API_KEY").ok())
-            .or_else(|| Self::read_codex_auth_file())
+        // Not needed for local log scanning, but kept for trait.
+        Self::sessions_dir()
+            .filter(|d| d.exists())
+            .map(|d| d.to_string_lossy().to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    #[test]
+    fn estimate_cost_basic() {
+        let usage = TokenUsage {
+            input_tokens: 1_000_000,
+            cached_input_tokens: 0,
+            output_tokens: 1_000_000,
+            reasoning_output_tokens: 0,
+        };
+        let cost = CodexProvider::estimate_cost(&usage);
+        // 1M * $2.50/M + 1M * $10/M = $12.50
+        assert!((cost - 12.50).abs() < 0.01, "expected ~12.50, got {cost}");
+    }
+
+    #[test]
+    fn estimate_cost_with_cache() {
+        let usage = TokenUsage {
+            input_tokens: 1_000_000,
+            cached_input_tokens: 800_000,
+            output_tokens: 100_000,
+            reasoning_output_tokens: 0,
+        };
+        let cost = CodexProvider::estimate_cost(&usage);
+        // non-cached: 200k * 2.50/M = 0.50
+        // cached: 800k * 0.25/M = 0.20
+        // output: 100k * 10/M = 1.00
+        // total = 1.70
+        assert!((cost - 1.70).abs() < 0.01, "expected ~1.70, got {cost}");
+    }
+
+    #[test]
+    fn parse_session_extracts_token_count() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let path = dir.path().join("session.jsonl");
+        let mut f = fs::File::create(&path).expect("create file");
+
+        let entry = serde_json::json!({
+            "timestamp": "2026-04-12T15:00:00Z",
+            "type": "event_msg",
+            "payload": {
+                "type": "token_count",
+                "info": {
+                    "total_token_usage": {
+                        "input_tokens": 5000,
+                        "cached_input_tokens": 3000,
+                        "output_tokens": 1000,
+                        "reasoning_output_tokens": 500,
+                        "total_tokens": 6000
+                    }
+                },
+                "rate_limits": {
+                    "limit_id": "codex",
+                    "limit_name": null,
+                    "primary": {
+                        "used_percent": 20.0,
+                        "window_minutes": 300,
+                        "resets_at": 1776010778
+                    },
+                    "secondary": {
+                        "used_percent": 8.0,
+                        "window_minutes": 10080,
+                        "resets_at": 1776395455
+                    },
+                    "plan_type": "pro"
+                }
+            }
+        });
+        writeln!(f, "{}", entry).expect("write");
+        drop(f);
+
+        let result = CodexProvider::parse_session(&path.to_path_buf());
+        assert!(result.is_some());
+        let (usage, rate_limits) = result.unwrap();
+        assert_eq!(usage.input_tokens, 5000);
+        assert_eq!(usage.cached_input_tokens, 3000);
+        assert_eq!(usage.output_tokens, 1000);
+
+        let rl = rate_limits.unwrap();
+        assert_eq!(rl.plan_type.as_deref(), Some("pro"));
+        assert!((rl.primary.unwrap().used_percent - 20.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn parse_session_returns_last_entry() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let path = dir.path().join("session.jsonl");
+        let mut f = fs::File::create(&path).expect("create file");
+
+        // First entry
+        let entry1 = serde_json::json!({
+            "type": "event_msg",
+            "payload": {
+                "type": "token_count",
+                "info": {
+                    "total_token_usage": {
+                        "input_tokens": 100,
+                        "cached_input_tokens": 0,
+                        "output_tokens": 50,
+                        "reasoning_output_tokens": 0,
+                        "total_tokens": 150
+                    }
+                }
+            }
+        });
+        writeln!(f, "{}", entry1).expect("write");
+
+        // Second (later) entry — should win
+        let entry2 = serde_json::json!({
+            "type": "event_msg",
+            "payload": {
+                "type": "token_count",
+                "info": {
+                    "total_token_usage": {
+                        "input_tokens": 5000,
+                        "cached_input_tokens": 2000,
+                        "output_tokens": 1000,
+                        "reasoning_output_tokens": 0,
+                        "total_tokens": 6000
+                    }
+                }
+            }
+        });
+        writeln!(f, "{}", entry2).expect("write");
+        drop(f);
+
+        let (usage, _) = CodexProvider::parse_session(&path.to_path_buf()).unwrap();
+        assert_eq!(usage.input_tokens, 5000);
+        assert_eq!(usage.output_tokens, 1000);
     }
 }

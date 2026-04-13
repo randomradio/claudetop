@@ -34,13 +34,7 @@ impl CostTracker {
             }
         }
 
-        // Scan Codex session logs
-        if let Some(codex_dir) = codex_session_dir() {
-            let cost = scan_directory(&codex_dir, cutoff);
-            if cost > 0.0 {
-                costs.insert("codex".to_string(), cost);
-            }
-        }
+        // Codex costs are handled by the Codex provider directly from session logs.
 
         self.costs = costs;
     }
@@ -60,11 +54,6 @@ impl Default for CostTracker {
 /// Return the Claude session logs directory (~/.claude/projects/).
 fn claude_session_dir() -> Option<PathBuf> {
     dirs::home_dir().map(|h| h.join(".claude").join("projects"))
-}
-
-/// Return the Codex session logs directory (~/.codex/).
-fn codex_session_dir() -> Option<PathBuf> {
-    dirs::home_dir().map(|h| h.join(".codex"))
 }
 
 /// Recursively scan a directory for JSONL files modified within the cutoff
