@@ -2,6 +2,13 @@
 name = "claudetop"
 version = "0.1.0"
 edition = "2021"
+description = "Terminal dashboard for monitoring AI provider usage and costs"
+license = "MIT"
+repository = "https://github.com/randomradio/claudetop"
+homepage = "https://github.com/randomradio/claudetop"
+keywords = ["tui", "claude", "ai", "dashboard", "terminal"]
+categories = ["command-line-utilities"]
+readme = "README.md"
 
 [dependencies]
 ratatui = "0.29"
