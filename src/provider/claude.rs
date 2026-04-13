@@ -24,10 +24,27 @@ impl ClaudeProvider {
         Self { config }
     }
 
+    /// Extract plan info from Keychain JSON (called separately from token discovery).
+    fn read_keychain_plan_info() -> Option<(String, String)> {
+        let output = Command::new("security")
+            .args(["find-generic-password", "-s", "Claude Code-credentials", "-w"])
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let password = String::from_utf8(output.stdout).ok()?.trim().to_string();
+        let value: serde_json::Value = serde_json::from_str(&password).ok()?;
+        let oauth = value.get("claudeAiOauth")?;
+        let tier = oauth.get("rateLimitTier").and_then(|v| v.as_str()).unwrap_or("unknown");
+        let sub = oauth.get("subscriptionType").and_then(|v| v.as_str()).unwrap_or("unknown");
+        Some((sub.to_string(), tier.to_string()))
+    }
+
     /// Try to read an OAuth token from macOS Keychain.
     ///
-    /// The Keychain entry for Claude Code stores a JSON blob as the password.
-    /// We extract the `accessToken` field from it.
+    /// The Keychain entry for Claude Code stores a JSON blob as the password,
+    /// with tokens nested under `claudeAiOauth`.
     fn read_keychain_token() -> Option<String> {
         let output = Command::new("security")
             .args(["find-generic-password", "-s", "Claude Code-credentials", "-w"])
@@ -43,14 +60,23 @@ impl ClaudeProvider {
             return None;
         }
 
-        // The password is JSON containing tokens — extract accessToken.
+        // The password is JSON. Tokens are nested under `claudeAiOauth.accessToken`.
         if let Ok(value) = serde_json::from_str::<serde_json::Value>(&password) {
+            // Primary: claudeAiOauth.accessToken (actual macOS Keychain format)
+            if let Some(token) = value
+                .get("claudeAiOauth")
+                .and_then(|o| o.get("accessToken"))
+                .and_then(|v| v.as_str())
+            {
+                return Some(token.to_string());
+            }
+            // Fallback: top-level accessToken
             if let Some(token) = value.get("accessToken").and_then(|v| v.as_str()) {
                 return Some(token.to_string());
             }
         }
 
-        // If not JSON or no accessToken field, use raw value as-is.
+        // If not JSON or no token found, use raw value as-is.
         Some(password)
     }
 
@@ -163,70 +189,74 @@ impl ClaudeProvider {
             });
         }
 
-        // Extract plan name from various possible field names.
-        let plan_name = value
-            .get("rate_limit_tier")
-            .or_else(|| value.get("rateLimitTier"))
-            .or_else(|| value.get("plan"))
-            .or_else(|| value.get("tier"))
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string());
+        // The actual API response format has flat keys:
+        // {"five_hour":{"utilization":32.0,"resets_at":"..."},
+        //  "seven_day":{"utilization":37.0,"resets_at":"..."},
+        //  "seven_day_sonnet":{"utilization":12.0,...},
+        //  "extra_usage":{"is_enabled":false,...}}
 
-        // Extract rate windows from array.
+        // Get plan name from Keychain metadata if available.
+        let plan_name = Self::read_keychain_plan_info()
+            .map(|(sub, _tier)| capitalize(&sub))
+            .or_else(|| {
+                value.get("rate_limit_tier")
+                    .or_else(|| value.get("plan"))
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+            });
+
+        // Parse rate windows from the flat response structure.
         let mut rate_windows = Vec::new();
-        let windows_key = if value.get("rate_windows").is_some() {
-            "rate_windows"
-        } else {
-            "rateWindows"
-        };
 
-        if let Some(windows) = value.get(windows_key).and_then(|v| v.as_array()) {
-            for window in windows {
-                let label = window
-                    .get("kind")
-                    .or_else(|| window.get("label"))
-                    .or_else(|| window.get("name"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("unknown")
-                    .to_string();
+        // Known rate window keys and their display labels
+        let window_defs = [
+            ("five_hour", "5h session"),
+            ("seven_day", "7d total"),
+            ("seven_day_sonnet", "7d Sonnet"),
+            ("seven_day_opus", "7d Opus"),
+            ("seven_day_cowork", "7d Cowork"),
+            ("iguana_necktie", "Special"),
+        ];
 
-                let used_percent = window
-                    .get("used_percent")
-                    .or_else(|| window.get("usedPercent"))
-                    .or_else(|| window.get("usage_percent"))
-                    .and_then(|v| v.as_f64())
-                    .unwrap_or(0.0);
+        for (key, label) in &window_defs {
+            if let Some(window) = value.get(key) {
+                let utilization = window.get("utilization").and_then(|v| v.as_f64());
+                if let Some(pct) = utilization {
+                    let reset_at = window
+                        .get("resets_at")
+                        .or_else(|| window.get("reset_at"))
+                        .and_then(|v| v.as_str())
+                        .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+                        .map(|dt| dt.with_timezone(&Utc));
 
-                let reset_at = window
-                    .get("reset_at")
-                    .or_else(|| window.get("resetAt"))
-                    .and_then(|v| v.as_str())
-                    .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
-                    .map(|dt| dt.with_timezone(&Utc));
-
-                rate_windows.push(RateWindow {
-                    label,
-                    used_percent,
-                    reset_at,
-                });
+                    rate_windows.push(RateWindow {
+                        label: label.to_string(),
+                        used_percent: pct,
+                        reset_at,
+                    });
+                }
             }
         }
 
-        // Extract credits info if present.
+        // Parse extra_usage for credit info
         let credits_remaining = value
-            .get("credits_remaining")
-            .or_else(|| value.get("creditsRemaining"))
-            .and_then(|v| {
-                if let Some(n) = v.as_f64() {
-                    Some(format!("${:.2}", n))
-                } else {
-                    v.as_str().map(|s| s.to_string())
+            .get("extra_usage")
+            .and_then(|eu| {
+                let enabled = eu.get("is_enabled").and_then(|v| v.as_bool()).unwrap_or(false);
+                if !enabled {
+                    return Some("\u{221e}".to_string()); // ∞ for unlimited
+                }
+                let used = eu.get("used_credits").and_then(|v| v.as_f64());
+                let limit = eu.get("monthly_limit").and_then(|v| v.as_f64());
+                match (used, limit) {
+                    (Some(u), Some(l)) => Some(format!("${:.0}/${:.0}", l - u, l)),
+                    _ => Some("Active".to_string()),
                 }
             });
 
         let status = if rate_windows.is_empty() && plan_name.is_none() {
             ProviderStatus::Unavailable(format!(
-                "OAuth endpoint returned OK but unrecognised format: {}",
+                "OAuth returned OK but unrecognised format: {}",
                 body_text.chars().take(300).collect::<String>()
             ))
         } else {
@@ -361,6 +391,15 @@ impl ClaudeProvider {
             used_percent,
             reset_at,
         })
+    }
+}
+
+/// Capitalize the first letter of a string (e.g. "max" -> "Max").
+fn capitalize(s: &str) -> String {
+    let mut c = s.chars();
+    match c.next() {
+        None => String::new(),
+        Some(f) => f.to_uppercase().collect::<String>() + c.as_str(),
     }
 }
 
