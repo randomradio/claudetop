@@ -8,6 +8,26 @@ use std::time::{Duration, SystemTime};
 use crate::config::ProviderConfig;
 use crate::provider::{Provider, ProviderKind, ProviderStatus, RateWindow, UsageSnapshot};
 
+/// CodexBar widget snapshot format — used to get global (cross-machine) cost data if available.
+#[derive(Debug, Deserialize)]
+struct WidgetSnapshot {
+    #[serde(default)]
+    entries: Vec<WidgetEntry>,
+}
+
+#[derive(Debug, Deserialize)]
+struct WidgetEntry {
+    provider: String,
+    #[serde(default, rename = "tokenUsage")]
+    token_usage: Option<WidgetTokenUsage>,
+}
+
+#[derive(Debug, Deserialize)]
+struct WidgetTokenUsage {
+    #[serde(default, rename = "last30DaysCostUSD")]
+    last_30_days_cost_usd: f64,
+}
+
 /// Parsed from `event_msg` entries where `payload.type == "token_count"`.
 #[derive(Debug, Deserialize)]
 struct SessionEntry {
@@ -140,6 +160,22 @@ impl CodexProvider {
         last_usage.map(|u| (u, last_rate_limits))
     }
 
+    /// Try to read CodexBar's cached widget snapshot for global (cross-machine) cost data.
+    fn read_codexbar_snapshot() -> Option<WidgetEntry> {
+        let home = dirs::home_dir()?;
+        let path = home
+            .join("Library")
+            .join("Group Containers")
+            .join("group.com.steipete.codexbar")
+            .join("widget-snapshot.json");
+        let contents = fs::read_to_string(path).ok()?;
+        let snapshot: WidgetSnapshot = serde_json::from_str(&contents).ok()?;
+        snapshot
+            .entries
+            .into_iter()
+            .find(|e| e.provider == "codex")
+    }
+
     /// Estimate cost from token usage using Codex/OpenAI pricing.
     fn estimate_cost(usage: &TokenUsage) -> f64 {
         // GPT-5 / Codex pricing estimate (per 1M tokens):
@@ -237,6 +273,12 @@ impl Provider for CodexProvider {
                 });
             }
         }
+
+        // If CodexBar is installed, use its global cost (covers all machines).
+        // Otherwise fall back to local-only estimate.
+        let cost_30d = Self::read_codexbar_snapshot()
+            .and_then(|entry| entry.token_usage.map(|u| u.last_30_days_cost_usd))
+            .unwrap_or(cost_30d);
 
         Ok(UsageSnapshot {
             provider: ProviderKind::Codex,

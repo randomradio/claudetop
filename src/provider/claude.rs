@@ -2,7 +2,8 @@ use anyhow::Result;
 use chrono::{DateTime, Utc};
 use reqwest::header::{HeaderMap, HeaderValue, CONTENT_TYPE};
 use std::process::Command;
-use std::time::Duration;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use crate::config::ProviderConfig;
 use crate::provider::{Provider, ProviderKind, ProviderStatus, RateWindow, UsageSnapshot};
@@ -15,13 +16,58 @@ enum AuthMethod {
     ApiKey(String),
 }
 
+/// Cached snapshot with backoff tracking to avoid 429s.
+struct Cache {
+    snapshot: Option<UsageSnapshot>,
+    /// When we last hit a 429, used for backoff.
+    last_rate_limited: Option<Instant>,
+    /// Current backoff duration, doubles on each consecutive 429.
+    backoff: Duration,
+}
+
+impl Cache {
+    fn new() -> Self {
+        Self {
+            snapshot: None,
+            last_rate_limited: None,
+            backoff: Duration::from_secs(60),
+        }
+    }
+
+    /// Check if we should skip the API call due to recent 429.
+    fn should_skip(&self) -> bool {
+        if let Some(last) = self.last_rate_limited {
+            last.elapsed() < self.backoff
+        } else {
+            false
+        }
+    }
+
+    /// Record a 429 and increase backoff (up to 30 minutes).
+    fn record_rate_limit(&mut self) {
+        self.last_rate_limited = Some(Instant::now());
+        self.backoff = (self.backoff * 2).min(Duration::from_secs(1800));
+    }
+
+    /// Record a successful fetch, reset backoff.
+    fn record_success(&mut self, snapshot: UsageSnapshot) {
+        self.snapshot = Some(snapshot);
+        self.last_rate_limited = None;
+        self.backoff = Duration::from_secs(60);
+    }
+}
+
 pub struct ClaudeProvider {
     config: ProviderConfig,
+    cache: Mutex<Cache>,
 }
 
 impl ClaudeProvider {
     pub fn new(config: ProviderConfig) -> Self {
-        Self { config }
+        Self {
+            config,
+            cache: Mutex::new(Cache::new()),
+        }
     }
 
     /// Extract plan info from Keychain JSON (called separately from token discovery).
@@ -169,6 +215,11 @@ impl ClaudeProvider {
                 });
             }
         };
+
+        if status_code == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            // Signal 429 to caller for backoff handling.
+            return Err(anyhow::anyhow!("rate_limited"));
+        }
 
         if !status_code.is_success() {
             let error_msg = value
@@ -410,13 +461,63 @@ impl Provider for ClaudeProvider {
     }
 
     async fn fetch_usage(&self) -> Result<UsageSnapshot> {
-        match self.discover_auth() {
-            Some(AuthMethod::OAuth(token)) => self.fetch_oauth_usage(&token).await,
-            Some(AuthMethod::ApiKey(key)) => self.fetch_api_key_usage(&key).await,
-            None => Ok(UsageSnapshot::not_configured(
-                ProviderKind::Claude,
-                "Set ANTHROPIC_API_KEY or sign in to Claude Code",
-            )),
+        let auth = match self.discover_auth() {
+            Some(a) => a,
+            None => {
+                return Ok(UsageSnapshot::not_configured(
+                    ProviderKind::Claude,
+                    "Set ANTHROPIC_API_KEY or sign in to Claude Code",
+                ));
+            }
+        };
+
+        // Check backoff — if recently rate-limited, return cached data.
+        {
+            let cache = self.cache.lock().unwrap();
+            if cache.should_skip() {
+                if let Some(ref cached) = cache.snapshot {
+                    tracing::info!("Claude: returning cached data (backoff active)");
+                    return Ok(cached.clone());
+                }
+            }
+        }
+
+        let result = match auth {
+            AuthMethod::OAuth(token) => self.fetch_oauth_usage(&token).await,
+            AuthMethod::ApiKey(key) => self.fetch_api_key_usage(&key).await,
+        };
+
+        match result {
+            Ok(snapshot) => {
+                if snapshot.status.is_ok() {
+                    self.cache.lock().unwrap().record_success(snapshot.clone());
+                }
+                Ok(snapshot)
+            }
+            Err(e) if e.to_string().contains("rate_limited") => {
+                let mut cache = self.cache.lock().unwrap();
+                cache.record_rate_limit();
+                tracing::warn!(
+                    "Claude: 429 rate limited, backoff for {}s",
+                    cache.backoff.as_secs()
+                );
+                if let Some(ref cached) = cache.snapshot {
+                    Ok(cached.clone())
+                } else {
+                    Ok(UsageSnapshot {
+                        provider: ProviderKind::Claude,
+                        status: ProviderStatus::Unavailable(
+                            "Rate limited (429), no cached data yet".to_string(),
+                        ),
+                        plan_name: None,
+                        rate_windows: Vec::new(),
+                        credits_remaining: None,
+                        cost_30d: None,
+                        updated_at: Utc::now(),
+                    })
+                }
+            }
+            Err(e) => Err(e),
         }
     }
 
