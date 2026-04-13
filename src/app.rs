@@ -1,7 +1,7 @@
 use std::time::Instant;
 
 use anyhow::Result;
-use crossterm::event::{Event, KeyCode, KeyModifiers};
+use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers};
 
 use crate::config::Config;
 use crate::cost::CostTracker;
@@ -92,6 +92,10 @@ impl App {
     /// Handle a terminal key event.
     pub fn handle_key(&mut self, event: &Event) -> bool {
         if let Event::Key(key) = event {
+            // Defense-in-depth: only process press events
+            if key.kind != KeyEventKind::Press {
+                return false;
+            }
             // Support Ctrl+C to quit
             if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
                 self.should_quit = true;

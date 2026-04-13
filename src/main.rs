@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 use crossterm::{
-    event::{self, Event, KeyCode},
+    event::{self, Event, KeyCode, KeyEventKind},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -57,6 +57,14 @@ async fn main() -> Result<()> {
 
         if event::poll(tick_rate)? {
             let ev = event::read()?;
+
+            // Only process key press events, not release or repeat
+            if let Event::Key(key) = &ev {
+                if key.kind != KeyEventKind::Press {
+                    continue;
+                }
+            }
+
             let needs_action = app.handle_key(&ev);
 
             if app.should_quit {
